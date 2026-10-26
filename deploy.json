@@ -1,0 +1,11 @@
+{
+  "target": "auto-ship",
+  "hooks": [
+    { "event": "PreToolUse", "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell", "script": "hook.js", "timeout": 10 },
+    { "event": "PostToolUse", "matcher": "AskUserQuestion", "script": "hook.js", "timeout": 10 },
+    { "event": "UserPromptSubmit", "script": "hook.js", "timeout": 10 },
+    { "event": "Stop", "script": "hook.js", "timeout": 30 }
+  ],
+  "exclude": ["test.js"],
+  "test": "node test.js"
+}
