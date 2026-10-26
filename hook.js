@@ -1,4 +1,4 @@
-// auto-ship 的 hook 入口：PreToolUse 記下動到的 repo、擋未問可見性的新增 repo；Stop 時要求 commit＋push
+// auto-ship 的 hook 入口：PreToolUse 記下動到的 repo、把關 repo 可見性；PostToolUse 提醒告知新 repo；Stop 時要求 commit＋push
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -9,7 +9,11 @@ const L = require('./lib');
 const out = (obj) => process.stdout.write(JSON.stringify(obj));
 const FILE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 const SHELLS = new Set(['Bash', 'PowerShell']);
-const NEW_REPO = /\bgit(?:\s+-C\s+\S+)?\s+init\b|\bgh\s+repo\s+create\b|toolkeeper[\\/]cli\.js["']?\s+new\b/i;
+// 只看指令開頭（行首或 ; & | 之後），heredoc、字串裡提到的不算
+const CMD = (re) => new RegExp(`(?:^|[;&|(]\\s*)(?:\\S*[\\\\/])?${re}`, 'im');
+const CREATE = CMD('gh(?:\\.exe)?\\s+repo\\s+create\\b');
+const EDIT_VIS = CMD('gh(?:\\.exe)?\\s+(?:repo\\s+edit\\b[^\\n]*--visibility\\b|api\\b[^\\n]*\\b(?:private|visibility)=)');
+const MENTION_VIS = /公開|私人|私有|可見性|public|private|visibility/i;
 const SECRET = /(^|\/)(\.env(\.[^/]*)?|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx)|[^/]*(secret|credential)[^/]*)$/i;
 const SAFE_ENV = /\.env\.(example|sample|template)$/i;
 const LABEL = { public: '公開', private: '私人' };
@@ -74,15 +78,16 @@ function track(sd, dirs, cfg) {
   }
 }
 
-function gate(cmd, cwd, sd, cfg) {
-  if (!cmd || !NEW_REPO.test(cmd)) return null;
-  if ((cwd && exempt(cwd, cfg)) || cfg.exemptDirs.some((d) => L.norm(cmd).includes(L.norm(d)))) return null;
-  const vis = meta(sd).visibility;
-  if (!vis) return deny('auto-ship：新增 repo 前要先用 AskUserQuestion 問使用者這個 repo 要設「公開」還是「私人」（選項就用這兩個詞），問完再重跑這個指令。');
-  if (/\bgh\s+repo\s+create\b/i.test(cmd)) {
+// 新 repo 預設公開（使用者在 prompt 講了私人才用私人）；既有 repo 的可見性只有使用者這一輪 prompt 提到才能改
+function gate(cmd, sd) {
+  if (!cmd) return null;
+  const m = meta(sd);
+  if (CREATE.test(cmd)) {
+    const vis = m.visibility || 'public';
     const flags = (cmd.match(/--(public|private|internal)\b/gi) || []).map((f) => f.slice(2).toLowerCase());
-    if (flags.length !== 1 || flags[0] !== vis) return deny(`auto-ship：使用者選了${LABEL[vis]}，gh repo create 要帶 --${vis}，而且只帶這一個可見性參數。`);
+    if (flags.length !== 1 || flags[0] !== vis) return deny(`auto-ship：新 repo ${m.visibility ? `使用者指定${LABEL[vis]}` : '預設公開，不用問使用者'}，gh repo create 要帶 --${vis}，而且只帶這一個可見性參數。`);
   }
+  if (EDIT_VIS.test(cmd) && !m.promptVis) return deny('auto-ship：既有 repo 的可見性要沿用，使用者沒要求就不能改。');
   return null;
 }
 
@@ -92,7 +97,7 @@ function onPreToolUse(input, cfg) {
   const ti = input.tool_input || {};
   const sd = L.sessionDir(input.session_id);
   if (SHELLS.has(tool)) {
-    const d = gate(ti.command, input.cwd, sd, cfg);
+    const d = gate(ti.command, sd);
     if (d) return out(d);
   }
   track(sd, targetDirs(tool, ti, input.cwd), cfg);
@@ -100,32 +105,26 @@ function onPreToolUse(input, cfg) {
   if (FILE_TOOLS.has(tool) && f) fs.appendFileSync(path.join(sd, 'touched.log'), `${L.slash(path.resolve(input.cwd || '.', f))}\n`);
 }
 
-// 只看使用者選的答案；找不到答案欄位時，先拿掉題目與選項文字再判斷
-function answerText(input) {
-  const ti = input.tool_input || {};
-  const tr = input.tool_response;
-  const ans = (tr && typeof tr === 'object' && tr.answers) || ti.answers;
-  if (ans && typeof ans === 'object') return Object.values(ans).join(' ');
-  let s = typeof tr === 'string' ? tr : JSON.stringify(tr || '');
-  const picked = [...s.matchAll(/"=\\?"([^"\\]*)/g)].map((m) => m[1]);
-  if (picked.length) return picked.join(' ');
-  for (const q of ti.questions || []) {
-    for (const t of [q.question, q.header, ...(q.options || []).flatMap((o) => [o.label, o.description])]) if (t) s = s.split(t).join(' ');
-  }
-  return s;
-}
-
+// gh repo create 成功後提醒 Claude 告訴使用者網址與可見性
 function onPostToolUse(input) {
-  if (input.tool_name !== 'AskUserQuestion') return;
-  const v = visOf(answerText(input));
-  if (v) saveMeta(L.sessionDir(input.session_id), { visibility: v });
+  const cmd = (input.tool_input || {}).command;
+  if (!SHELLS.has(input.tool_name) || !cmd || !CREATE.test(cmd)) return;
+  const tr = input.tool_response;
+  const text = typeof tr === 'string' ? tr : JSON.stringify(tr || '');
+  const url = (text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+/) || [])[0];
+  if (!url) return;
+  const vis = /--private\b/i.test(cmd) ? 'private' : 'public';
+  out({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: `auto-ship：回覆時告訴使用者新 repo ${url.replace(/\.git$/, '')} 已設為${LABEL[vis]}。` } });
 }
 
-// 使用者自己在 prompt 裡講了（提到 repo，或很短的回答）也算數
+// 使用者在 prompt 裡指定新 repo 的可見性（提到 repo，或很短的回答）；promptVis 只對這一輪有效
 function onUserPromptSubmit(input) {
   const p = String(input.prompt || '');
   const v = visOf(p);
-  if (v && (/repo|儲存庫/i.test(p) || p.trim().length <= 20)) saveMeta(L.sessionDir(input.session_id), { visibility: v });
+  const sd = L.sessionDir(input.session_id);
+  const patch = { promptVis: MENTION_VIS.test(p) };
+  if (v && (/repo|儲存庫/i.test(p) || p.trim().length <= 20)) patch.visibility = v;
+  if (patch.promptVis || meta(sd).promptVis) saveMeta(sd, patch);
 }
 
 const fmt = (list) => (list.length > LIST_MAX ? `${list.slice(0, LIST_MAX).join(', ')} 等 ${list.length} 個` : list.join(', '));
@@ -152,7 +151,7 @@ function inspect(rec, touched, vis) {
     if (files.length || (moved && ahead > 0)) lines.push(`push 到 ${upstream}${ahead ? `（已有 ${ahead} 個 commit 未 push）` : ''}`);
   } else if (remotes.length && (files.length || moved)) lines.push(`還沒有上游分支：git push -u ${remotes.includes('origin') ? 'origin' : remotes[0]} ${branch}`);
   else if (!remotes.length && rec.newRepo && (files.length || moved)) {
-    lines.push(vis ? `沒有遠端：gh repo create <名稱> --${vis} --source . --push` : '沒有遠端：先用 AskUserQuestion 問使用者要「公開」還是「私人」，再 gh repo create <名稱> --<public|private> --source . --push');
+    lines.push(`沒有遠端：gh repo create <名稱> --${vis} --source . --push（${vis === 'public' ? '預設公開，不用問' : '使用者指定私人'}），建好告訴使用者網址與可見性`);
   }
   if (!lines.length && !secret.length) return null;
   if (secret.length) lines.push(`疑似機密（不要 commit，先問使用者）：${fmt(secret)}`);
@@ -177,7 +176,7 @@ function onStop(input, cfg) {
   const report = fs.readdirSync(sd).filter((f) => /^repo-.*\.json$/.test(f))
     .map((f) => L.readJson(path.join(sd, f), null))
     .filter((rec) => rec && fs.existsSync(rec.root) && !skipped(rec.root, cfg))
-    .map((rec) => inspect(rec, touched, m.visibility)).filter(Boolean);
+    .map((rec) => inspect(rec, touched, m.visibility || 'public')).filter(Boolean);
   if (!report.length) return;
   const body = report.join('\n');
   const sig = crypto.createHash('sha1').update(body).digest('hex');
@@ -208,4 +207,4 @@ function main() {
 if (require.main === module) {
   try { main(); } catch (e) { process.stderr.write(`auto-ship：${e.message}\n`); }
 }
-module.exports = { visOf, shellDirs, answerText, NEW_REPO };
+module.exports = { visOf, shellDirs, CREATE, EDIT_VIS };

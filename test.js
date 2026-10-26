@@ -1,4 +1,4 @@
-// auto-ship 測試：既有 repo 改檔、原有未 commit 的檔、迴圈保護、新增 repo 的可見性關卡、機密檔
+// auto-ship 測試：既有 repo 改檔、原有未 commit 的檔、迴圈保護、新 repo 預設公開、既有 repo 可見性不能擅改、機密檔
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -45,8 +45,11 @@ test('純函式：可見性判斷、Git Bash 路徑', () => {
   assert.strictEqual(H.visOf('公開還是私人'), null);
   const d = H.shellDirs('cd /c/x/y && git -C "D:/z" status', 'C:/w');
   assert.deepStrictEqual(d.map((p) => p.replace(/\\/g, '/').toLowerCase()), ['c:/w', 'c:/x/y', 'd:/z']);
-  assert.ok(H.NEW_REPO.test('node ~/.claude/toolkeeper/cli.js new foo'));
-  assert.ok(!H.NEW_REPO.test('git initialize'));
+  assert.ok(H.CREATE.test('cd x && gh repo create foo --public'));
+  assert.ok(!H.CREATE.test('echo "gh repo create" > notes.md'));
+  assert.ok(H.EDIT_VIS.test('gh repo edit a/b --visibility private --accept-visibility-change-consequences'));
+  assert.ok(H.EDIT_VIS.test('gh api -X PATCH repos/a/b -f private=true'));
+  assert.ok(!H.EDIT_VIS.test('gh repo edit a/b --description x'));
 });
 
 test('既有 repo：改檔要求 commit＋push，原有未 commit 的檔不算', () => {
@@ -91,31 +94,45 @@ test('沒動到的 repo、不在 repo 裡、skip 清單：都不輸出', () => {
   assert.strictEqual(stop('never-seen'), null);
 });
 
-test('新增 repo：沒問可見性先擋，問完放行，gh 參數要一致', () => {
+const isDeny = (r) => r && r.hookSpecificOutput.permissionDecision === 'deny';
+const post = (sid, command, stdout) => run({ hook_event_name: 'PostToolUse', session_id: sid, tool_name: 'Bash', tool_input: { command }, tool_response: { stdout, stderr: '' } });
+const prompt = (sid, text) => run({ hook_event_name: 'UserPromptSubmit', session_id: sid, prompt: text });
+
+test('新 repo：不問直接放行，預設公開，建好提醒告訴使用者', () => {
   const dir = path.join(tmp, 'fresh');
   fs.mkdirSync(dir);
-  const d = pre('s4', 'Bash', { command: 'git init' }, dir);
-  assert.strictEqual(d.hookSpecificOutput.permissionDecision, 'deny');
-  const q = { questions: [{ question: '要公開還是私人？', header: '可見性', options: [{ label: '公開', description: '' }, { label: '私人', description: '' }] }] };
-  run({ hook_event_name: 'PostToolUse', session_id: 's4', tool_name: 'AskUserQuestion', tool_input: q, tool_response: { ...q, answers: { '要公開還是私人？': '私人' } } });
   assert.strictEqual(pre('s4', 'Bash', { command: 'git init' }, dir), null);
   sh(dir, 'init', '-q', '-b', 'main');
   fs.writeFileSync(path.join(dir, 'n.txt'), 'n');
   const r = stop('s4');
   assert.match(r.reason, /未 commit：n\.txt/);
-  assert.match(r.reason, /gh repo create <名稱> --private --source \. --push/);
-  assert.strictEqual(pre('s4', 'Bash', { command: 'gh repo create fresh --public --source .' }, dir).hookSpecificOutput.permissionDecision, 'deny');
-  assert.strictEqual(pre('s4', 'Bash', { command: 'gh repo create fresh --private --source . --push' }, dir), null);
+  assert.match(r.reason, /gh repo create <名稱> --public --source \. --push（預設公開/);
+  assert.ok(isDeny(pre('s4', 'Bash', { command: 'gh repo create fresh --source .' }, dir)));
+  assert.ok(isDeny(pre('s4', 'Bash', { command: 'gh repo create fresh --private --source .' }, dir)));
+  assert.strictEqual(pre('s4', 'Bash', { command: 'gh repo create fresh --public --source . --push' }, dir), null);
+  const ctx = post('s4', 'gh repo create fresh --public --source . --push', 'https://github.com/u/fresh\n').hookSpecificOutput.additionalContext;
+  assert.match(ctx, /github\.com\/u\/fresh 已設為公開/);
+  assert.strictEqual(post('s4', 'gh repo create fresh --public', 'HTTP 422'), null);
+  assert.strictEqual(post('s4', 'git status', 'https://github.com/u/fresh'), null);
 });
 
-test('答案欄位缺少時從回傳字串判斷；使用者在 prompt 直接講也算', () => {
+test('使用者在 prompt 指定私人就用私人', () => {
   const dir = path.join(tmp, 'fresh2');
   fs.mkdirSync(dir);
-  const q = { questions: [{ question: '要公開還是私人？', header: '可見性', options: [{ label: '公開', description: '' }, { label: '私人', description: '' }] }] };
-  run({ hook_event_name: 'PostToolUse', session_id: 's5', tool_name: 'AskUserQuestion', tool_input: q, tool_response: 'User has answered your questions: "要公開還是私人？"="公開".' });
-  assert.match(pre('s5', 'Bash', { command: 'gh repo create x --private' }, dir).hookSpecificOutput.permissionDecisionReason, /--public/);
-  run({ hook_event_name: 'UserPromptSubmit', session_id: 's6', prompt: '幫我開個私人 repo 放筆記' });
+  prompt('s6', '幫我開個私人 repo 放筆記');
+  assert.ok(isDeny(pre('s6', 'Bash', { command: 'gh repo create notes --public' }, dir)));
   assert.strictEqual(pre('s6', 'Bash', { command: 'gh repo create notes --private' }, dir), null);
+});
+
+test('既有 repo 可見性：使用者這一輪沒提就不能改', () => {
+  const dir = path.join(tmp, 'fresh2');
+  const cmd = 'gh repo edit u/a --visibility private --accept-visibility-change-consequences';
+  prompt('s9', '幫我改 README');
+  assert.match(pre('s9', 'Bash', { command: cmd }, dir).hookSpecificOutput.permissionDecisionReason, /沿用/);
+  prompt('s9', '把這個 repo 改成私人');
+  assert.strictEqual(pre('s9', 'Bash', { command: cmd }, dir), null);
+  prompt('s9', '好，繼續');
+  assert.ok(isDeny(pre('s9', 'Bash', { command: cmd }, dir)));
 });
 
 test('機密檔另外列出、不要 commit', () => {
@@ -131,7 +148,6 @@ test('機密檔另外列出、不要 commit', () => {
 test('豁免暫存資料夾', () => {
   fs.writeFileSync(path.join(home, 'config.local.json'), JSON.stringify({ exemptTmp: true }));
   const dir = makeRepo('r8');
-  assert.strictEqual(pre('s8', 'Bash', { command: 'git init sub' }, dir), null);
   pre('s8', 'Edit', { file_path: path.join(dir, 'a.txt') }, dir);
   fs.writeFileSync(path.join(dir, 'a.txt'), 'q');
   assert.strictEqual(stop('s8'), null);
