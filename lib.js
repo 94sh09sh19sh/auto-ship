@@ -20,7 +20,7 @@ function readJson(file, fallback) {
 }
 
 function loadConfig() {
-  const cfg = { skip: [], exempt: [], exemptTmp: true, ...readJson(path.join(HOME, 'config.json'), {}), ...readJson(path.join(HOME, 'config.local.json'), {}) };
+  const cfg = { skip: [], exempt: [], owners: [], exemptTmp: true, ...readJson(path.join(HOME, 'config.json'), {}), ...readJson(path.join(HOME, 'config.local.json'), {}) };
   cfg.exemptDirs = [...cfg.exempt, ...(cfg.exemptTmp ? [os.tmpdir()] : [])];
   return cfg;
 }
@@ -62,6 +62,41 @@ function status(root) {
 
 const head = (root) => git(root, ['rev-parse', '-q', '--verify', 'HEAD']);
 
+// 沒指定遠端時 git push 的目標：branch.<b>.pushRemote → remote.pushDefault → branch.<b>.remote → origin
+function pushRemote(root) {
+  const b = git(root, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  const get = (k) => git(root, ['config', '--get', k]);
+  return (b && get(`branch.${b}.pushRemote`)) || get('remote.pushDefault') || (b && get(`branch.${b}.remote`)) || 'origin';
+}
+
+// 遠端網址的擁有者；本機路徑回 null，看不懂的網址回「?」（當成別人的）
+function remoteOwner(url) {
+  const s = String(url).trim().replace(/^["']|["']$/g, '');
+  if (/^(file:|\.{0,2}[\\/]|[a-z]:[\\/])/i.test(s) || fs.existsSync(s)) return null;
+  const m = s.match(/^(?:[\w+.-]+:\/\/)?(?:[^@/]+@)?[^/:]+(?::\d+)?[:/]+([^/]+)\//);
+  return m ? m[1] : /[:/]/.test(s) ? '?' : null;
+}
+
+// 使用者自己的帳號：config 的 owners＋gh 登入帳號（快取）；gh 查不到就只認 owners，寧可不推
+let ownSet = null;
+function owners(cfg) {
+  if (ownSet) return ownSet;
+  const cache = path.join(STATE, 'gh-user.json');
+  let login = readJson(cache, {}).login;
+  if (!login) {
+    try { login = execFileSync('gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 5000 }).trim(); } catch {}
+    if (login) { fs.mkdirSync(STATE, { recursive: true }); fs.writeFileSync(cache, JSON.stringify({ login })); }
+  }
+  ownSet = new Set([...(cfg.owners || []), login].filter(Boolean).map((o) => o.toLowerCase()));
+  return ownSet;
+}
+
+// remote 是遠端名稱或網址；推到別人的 repo 就回擁有者，否則 null
+function foreignOwner(root, remote, cfg) {
+  const o = remoteOwner(git(root, ['remote', 'get-url', '--push', remote]) ?? remote);
+  return o && !owners(cfg).has(o.toLowerCase()) ? o : null;
+}
+
 // session 狀態：多個 hook 可能同時跑，記錄一律附加寫入或 wx 建檔，不改寫共用檔
 function sessionDir(sid) {
   const d = path.join(STATE, String(sid).replace(/[^\w-]/g, '_'));
@@ -90,4 +125,4 @@ function cleanup() {
   }
 }
 
-module.exports = { HOME, STATE, slash, norm, under, readJson, loadConfig, readStdin, git, repoRoot, status, head, sessionDir, repoFile, readLines, saveBaseline, cleanup };
+module.exports = { HOME, STATE, slash, norm, under, readJson, loadConfig, readStdin, git, repoRoot, status, head, pushRemote, remoteOwner, foreignOwner, sessionDir, repoFile, readLines, saveBaseline, cleanup };

@@ -6,9 +6,11 @@ Claude Code 改完 repo 裡的檔，回合結束時自動要求 commit＋push �
 - `PreToolUse`（Write、Edit、MultiEdit、NotebookEdit、Bash、PowerShell）：第一次碰到某個 repo 時記下基準（HEAD 與 `git status`）；Bash 會看 cwd、`cd <路徑>`、`git -C <路徑>`。
 - 同一個 hook 也把關可見性：`gh repo create` 要帶 `--public`（不用問使用者），只有使用者在 prompt 指定私人才改帶 `--private`；`gh repo edit --visibility`、`gh api ... private=` 這類改既有 repo 可見性的指令，使用者這一輪 prompt 沒提到公開／私人就 deny。
 - 只認指令開頭的 `gh`，heredoc 或字串裡提到的不算。
+- 別人的 repo 不准 push：`git push` 的目標遠端（指定的遠端名稱或網址，沒指定就照 `pushRemote`→`remote.pushDefault`→上游→`origin`）擁有者不是使用者就 deny；看 cwd、`cd`、`git -C` 碰到的每個 repo。
+- 「使用者」＝`gh api user` 的登入帳號（快取在 `state/gh-user.json`）＋設定的 `owners`；gh 查不到時只認 `owners`，寧可擋下。本機路徑的遠端不算別人的。
 - `UserPromptSubmit`：使用者在 prompt 裡提到 repo 並講了公開或私人，或很短的回覆，就當成新 repo 的可見性；這一輪有沒有提到可見性也記下來。
 - `PostToolUse`（Bash、PowerShell）：`gh repo create` 成功後注入一句提醒，要 Claude 回覆時告訴使用者網址與可見性。
-- `Stop`：比對基準，列出各 repo 的未 commit 檔與未 push 的 commit，用 `decision: block` 要求 Claude 處理；commit 訊息由 Claude 自己寫，不機械式 commit。
+- `Stop`：比對基準，列出各 repo 的未 commit 檔與未 push 的 commit（別人的 repo 只要求 commit、明講不准 push），用 `decision: block` 要求 Claude 處理；commit 訊息由 Claude 自己寫，不機械式 commit。
 - 只算這個 session 改的檔；開始前就未 commit 的檔、疑似機密檔（`.env`、`*.pem`、`*.key` 等）另外列出、要求不要加。
 - 新 repo 沒有遠端時，提示 `gh repo create <名稱> --public --source . --push` 並要求建好後告知；沒有遠端的既有 repo 只要求 commit；detached HEAD 只 commit 不 push。
 - 擋一次後同樣狀況還是停下就放行並提醒使用者，不會無限迴圈；沒事時完全不輸出。
@@ -20,11 +22,13 @@ Claude Code 改完 repo 裡的檔，回合結束時自動要求 commit＋push �
 ## 設定
 - 預設值在 `config.json`；個人設定放執行端的 `config.local.json`，不會被部署覆蓋，也不會進 repo。
 - `skip`：不要自動 commit＋push 的 repo 路徑（含子資料夾）。
+- `owners`：除了 gh 登入帳號，也算使用者自己的 GitHub 帳號或組織（不分大小寫）；推到其他擁有者一律擋。
 - `exempt`：完全不追蹤的資料夾；`exemptTmp: true` 時系統暫存資料夾也算。
 - `debug: true`：把每個事件的輸入存到 `state/<session>/debug-<事件>.json`，用來查 hook 收到什麼。
 
 ## 限制
 - 使用者在 prompt 指定的私人會沿用到同一個 session 之後建的 repo，要改回公開得再講一次。
+- 擋 push 只看 `git push` 指令；指令藏在變數或腳本裡、別的工具推送都管不到。
 - 只擋 `gh` CLI 改可見性；在 GitHub 網頁或其他工具改的管不到。
 - Bash 指令裡用變數或子 shell 切換資料夾，追不到；這種情況靠 CLAUDE.md 規則。
 - 多個 Stop hook 同時跑時（例：iter-chain 判斷本輪結束），對方可能在 commit 完成前就先動作。

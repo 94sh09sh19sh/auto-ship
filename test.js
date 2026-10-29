@@ -1,4 +1,4 @@
-// auto-ship 測試：既有 repo 改檔、原有未 commit 的檔、迴圈保護、新 repo 預設公開、既有 repo 可見性不能擅改、機密檔
+// auto-ship 測試：既有 repo 改檔、原有未 commit 的檔、迴圈保護、新 repo 預設公開、既有 repo 可見性不能擅改、機密檔、別人的 repo 不准 push
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -12,6 +12,10 @@ fs.mkdirSync(home);
 fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ skip: [path.join(tmp, 'skipped')], exempt: [], exemptTmp: false }));
 const HOOK = path.join(__dirname, 'hook.js');
 const H = require('./hook');
+const L = require('./lib');
+// 假裝 gh 登入帳號是 me，不打 GitHub API
+fs.mkdirSync(path.join(home, 'state'));
+fs.writeFileSync(path.join(home, 'state', 'gh-user.json'), JSON.stringify({ login: 'me' }));
 
 const sh = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 function run(input, env = {}) {
@@ -143,6 +147,45 @@ test('機密檔另外列出、不要 commit', () => {
   const r = stop('s7');
   assert.match(r.reason, /疑似機密.*\.env(?!\.)/);
   assert.match(r.reason, /未 commit：\.env\.example/);
+});
+
+test('純函式：遠端擁有者、push 參數', () => {
+  assert.strictEqual(L.remoteOwner('https://github.com/a/b.git'), 'a');
+  assert.strictEqual(L.remoteOwner('git@github.com:A/b.git'), 'A'); // toolkeeper: allow
+  assert.strictEqual(L.remoteOwner('ssh://git@h:22/o/r'), 'o');
+  assert.strictEqual(L.remoteOwner('https://u:t@github.com/x/y'), 'x'); // toolkeeper: allow
+  assert.strictEqual(L.remoteOwner('C:\\x\\y.git'), null);
+  assert.strictEqual(L.remoteOwner('../r.git'), null);
+  assert.strictEqual(H.pushArg(' -u origin main'), 'origin');
+  assert.strictEqual(H.pushArg(' -o ci.skip --force'), null);
+  assert.strictEqual(H.pushArg(' --repo=https://github.com/z/w'), 'https://github.com/z/w');
+});
+
+test('別人的 repo：不准 push，Stop 只要求 commit', () => {
+  const dir = makeRepo('r10');
+  sh(dir, 'remote', 'set-url', '--push', 'origin', 'https://github.com/other/r10.git');
+  pre('s10', 'Edit', { file_path: path.join(dir, 'a.txt') }, dir);
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'w');
+  const r = stop('s10');
+  assert.match(r.reason, /別人的 repo（other）：只 commit/);
+  assert.doesNotMatch(r.reason, /push 到 origin/);
+  for (const cmd of ['git push', 'git push -u origin main', 'git add . && git commit -m x && git push']) assert.ok(isDeny(pre('s10', 'Bash', { command: cmd }, dir)), cmd);
+  assert.ok(isDeny(pre('s10', 'Bash', { command: `git -C "${dir}" push` }, tmp)));
+  assert.ok(isDeny(pre('s10', 'PowerShell', { command: `cd "${dir}"; git push origin main` }, tmp)));
+  assert.strictEqual(pre('s10', 'Bash', { command: 'echo "git push" > notes.md' }, dir), null);
+  sh(dir, 'commit', '-q', '-am', 'x');
+  assert.strictEqual(stop('s10', true), null);
+});
+
+test('自己的 repo（gh 帳號或 owners）與本機遠端：push 放行', () => {
+  const dir = makeRepo('r11');
+  sh(dir, 'remote', 'set-url', '--push', 'origin', 'https://github.com/Me/r11.git');
+  assert.strictEqual(pre('s11', 'Bash', { command: 'git push' }, dir), null);
+  assert.ok(isDeny(pre('s11', 'Bash', { command: 'git push https://github.com/other/x.git main' }, dir)));
+  fs.writeFileSync(path.join(home, 'config.local.json'), JSON.stringify({ owners: ['Other'] }));
+  assert.strictEqual(pre('s11', 'Bash', { command: 'git push https://github.com/other/x.git main' }, dir), null);
+  fs.rmSync(path.join(home, 'config.local.json'));
+  assert.strictEqual(pre('s11', 'Bash', { command: 'git push' }, makeRepo('r12')), null);
 });
 
 test('豁免暫存資料夾', () => {

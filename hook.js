@@ -1,4 +1,4 @@
-// auto-ship 的 hook 入口：PreToolUse 記下動到的 repo、把關 repo 可見性；PostToolUse 提醒告知新 repo；Stop 時要求 commit＋push
+// auto-ship 的 hook 入口：PreToolUse 記下動到的 repo、把關 repo 可見性、擋 push 到別人的 repo；PostToolUse 提醒告知新 repo；Stop 時要求 commit＋push
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -13,6 +13,8 @@ const SHELLS = new Set(['Bash', 'PowerShell']);
 const CMD = (re) => new RegExp(`(?:^|[;&|(]\\s*)(?:\\S*[\\\\/])?${re}`, 'im');
 const CREATE = CMD('gh(?:\\.exe)?\\s+repo\\s+create\\b');
 const EDIT_VIS = CMD('gh(?:\\.exe)?\\s+(?:repo\\s+edit\\b[^\\n]*--visibility\\b|api\\b[^\\n]*\\b(?:private|visibility)=)');
+const PUSH = /(?:^|[;&|(]\s*)(?:\S*[\\/])?git(?:\.exe)?((?:\s+-[cC]\s+(?:"[^"]+"|'[^']+'|\S+))*)\s+push\b([^;&|)\n]*)/gim;
+const PUSH_VAL = new Set(['-o', '--push-option', '--receive-pack', '--exec']);
 const MENTION_VIS = /公開|私人|私有|可見性|public|private|visibility/i;
 const SECRET = /(^|\/)(\.env(\.[^/]*)?|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx)|[^/]*(secret|credential)[^/]*)$/i;
 const SAFE_ENV = /\.env\.(example|sample|template)$/i;
@@ -91,13 +93,42 @@ function gate(cmd, sd) {
   return null;
 }
 
+// git push 的第一個非選項參數是遠端（名稱或網址）；沒寫就用預設推送目標
+function pushArg(args) {
+  const toks = (args.match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) => t.replace(/^["']|["']$/g, ''));
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.startsWith('--repo=')) return t.slice(7);
+    if (t === '--repo') return toks[i + 1] || null;
+    if (PUSH_VAL.has(t)) { i++; continue; }
+    if (!t.startsWith('-')) return t;
+  }
+  return null;
+}
+
+// 別人的 repo 一律不准 push；看不出在哪個 repo 推就把 cwd、cd、git -C 碰到的都檢查
+function pushGate(cmd, cwd, cfg) {
+  if (!cmd) return null;
+  for (const m of String(cmd).matchAll(PUSH)) {
+    const c = m[1].match(/\s-C\s+("[^"]+"|'[^']+'|\S+)/);
+    const dirs = c ? [toPath(c[1], cwd)] : shellDirs(cmd, cwd);
+    const arg = pushArg(m[2]);
+    for (const d of dirs) {
+      const root = L.repoRoot(d);
+      const owner = root && L.foreignOwner(root, arg || L.pushRemote(root), cfg);
+      if (owner) return deny(`auto-ship：${root} 的 push 目標是別人的 repo（${owner}），不准 push，也不准改設定繞過；只 commit，並告訴使用者沒有 push。`);
+    }
+  }
+  return null;
+}
+
 function onPreToolUse(input, cfg) {
   const tool = input.tool_name;
   if (!FILE_TOOLS.has(tool) && !SHELLS.has(tool)) return;
   const ti = input.tool_input || {};
   const sd = L.sessionDir(input.session_id);
   if (SHELLS.has(tool)) {
-    const d = gate(ti.command, sd);
+    const d = gate(ti.command, sd) || pushGate(ti.command, input.cwd || process.cwd(), cfg);
     if (d) return out(d);
   }
   track(sd, targetDirs(tool, ti, input.cwd), cfg);
@@ -129,7 +160,7 @@ function onUserPromptSubmit(input) {
 
 const fmt = (list) => (list.length > LIST_MAX ? `${list.slice(0, LIST_MAX).join(', ')} 等 ${list.length} 個` : list.join(', '));
 
-function inspect(rec, touched, vis) {
+function inspect(rec, touched, vis, cfg) {
   const root = rec.root;
   const cur = L.status(root);
   const rel = touched.filter((t) => L.under(t, root)).map((t) => L.norm(t).slice(L.norm(root).length + 1));
@@ -143,9 +174,12 @@ function inspect(rec, touched, vis) {
   const remotes = (L.git(root, ['remote']) || '').split('\n').filter(Boolean);
   const upstream = L.git(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
   const moved = rec.newRepo ? !!h : !!h && h !== rec.head;
+  const target = remotes.length ? (upstream ? L.pushRemote(root) : remotes.includes('origin') ? 'origin' : remotes[0]) : null;
+  const other = target && L.foreignOwner(root, target, cfg);
   const lines = [];
   if (files.length) lines.push(`未 commit：${fmt(files)}`);
-  if (!branch && (files.length || moved)) lines.push('detached HEAD：只 commit 不 push，並告訴使用者');
+  if (other) { if (files.length) lines.push(`別人的 repo（${other}）：只 commit，絕對不准 push，並告訴使用者沒有 push`); }
+  else if (!branch && (files.length || moved)) lines.push('detached HEAD：只 commit 不 push，並告訴使用者');
   else if (remotes.length && upstream) {
     const ahead = Number(L.git(root, ['rev-list', '--count', '@{u}..HEAD']) || 0);
     if (files.length || (moved && ahead > 0)) lines.push(`push 到 ${upstream}${ahead ? `（已有 ${ahead} 個 commit 未 push）` : ''}`);
@@ -176,7 +210,7 @@ function onStop(input, cfg) {
   const report = fs.readdirSync(sd).filter((f) => /^repo-.*\.json$/.test(f))
     .map((f) => L.readJson(path.join(sd, f), null))
     .filter((rec) => rec && fs.existsSync(rec.root) && !skipped(rec.root, cfg))
-    .map((rec) => inspect(rec, touched, m.visibility || 'public')).filter(Boolean);
+    .map((rec) => inspect(rec, touched, m.visibility || 'public', cfg)).filter(Boolean);
   if (!report.length) return;
   const body = report.join('\n');
   const sig = crypto.createHash('sha1').update(body).digest('hex');
@@ -187,7 +221,7 @@ function onStop(input, cfg) {
   saveMeta(sd, { lastBlock: sig });
   out({
     decision: 'block',
-    reason: `auto-ship：這個 session 改過的 repo 還沒 commit＋push。使用者的預設是改完就 commit 並 push 到目前分支，不用等指示、不開新分支：只 add 下面列的檔，commit 訊息用台灣繁中。push 被拒、有衝突或沒權限就停下說明；停下是在等使用者回答的話，再停一次即可。\n${body}`,
+    reason: `auto-ship：這個 session 改過的 repo 還沒 commit＋push。使用者的預設是改完就 commit 並 push 到目前分支，不用等指示、不開新分支（標「別人的 repo」的只 commit 不 push）：只 add 下面列的檔，commit 訊息用台灣繁中。push 被拒、有衝突或沒權限就停下說明；停下是在等使用者回答的話，再停一次即可。\n${body}`,
   });
 }
 
@@ -207,4 +241,4 @@ function main() {
 if (require.main === module) {
   try { main(); } catch (e) { process.stderr.write(`auto-ship：${e.message}\n`); }
 }
-module.exports = { visOf, shellDirs, CREATE, EDIT_VIS };
+module.exports = { visOf, shellDirs, pushArg, CREATE, EDIT_VIS };
